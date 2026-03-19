@@ -134,9 +134,11 @@ GitHub 레포 → `Settings` → `Secrets and variables` → `Actions` → `New 
 
 ---
 
-## 7. main.yml
+## 7. GitHub Actions 워크플로우 (yml)
 
+### main.yml — 스케줄 자동 실행
 
+```yaml
 name: Daily News Briefing Crawler
 
 on:
@@ -183,4 +185,4 @@ jobs:
         NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
       run: |
         python execution/github_종목명_news.py
-
+```
