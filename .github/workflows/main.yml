@@ -1,0 +1,46 @@
+name: Daily News Briefing Crawler
+
+on:
+  schedule:
+    - cron: '30 22 * * *'  # 매일 한국시간 오전 7시 30분 (UTC 22:30) 실행
+    - cron: '30 10 * * *'  # 매일 한국시간 오후 7시 30분 (UTC 10:30) 실행
+  workflow_dispatch:       # 수동 버튼 생성용
+
+jobs:
+  run-crawler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30    # 🔥 추가된 부분: 30분 초과 시 작업 강제 종료
+
+    permissions:
+      contents: read
+      
+    steps:
+    - name: 📦 리포지토리 복사해오기
+      uses: actions/checkout@v6
+
+    - name: 🐍 파이썬 환경 세팅
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
+
+    - name: 🛠️ 필요한 라이브러리 설치
+      run: |
+        pip install requests python-dotenv python-telegram-bot google-genai google-api-python-client google-auth-httplib2 google-auth-oauthlib supabase
+        
+    - name: 🚀 새싹 스크립트(github_종목명_news.py) 실행
+      env:
+        # 등록한 Secrets 변수들을 시스템에 연결
+        NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+        NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+        gemini: ${{ secrets.GEMINI_API_KEY }}
+        telegram_chat_id: ${{ secrets.TELEGRAM_CHAT_ID }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        GMAIL_USER: ${{ secrets.GMAIL_USER }}
+        notion: ${{ secrets.NOTION_API_KEY }}
+        GMAIL_TOKEN_JSON: ${{ secrets.GMAIL_TOKEN_JSON }}
+        GMAIL_CREDENTIALS_JSON: ${{ secrets.GMAIL_CREDENTIALS_JSON }}
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+      run: |
+        python execution/github_종목명_news.py
