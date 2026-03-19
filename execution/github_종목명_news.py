@@ -248,7 +248,7 @@ def cluster_similar_items(items):
             is_difflib_match = False
             if not is_token_match:
                 ratio = difflib.SequenceMatcher(None, rep_title, item_title).ratio()
-                if ratio >= SIMILARITY_THRESHOLD
+                if ratio >= SIMILARITY_THRESHOLD:
                     is_difflib_match = True
             
             # [Final Decision] OR Condition
