@@ -7,8 +7,9 @@ import csv
 import difflib
 import asyncio
 import base64
+import urllib.request
 from email.mime.text import MIMEText
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 from google.auth.transport.requests import Request
@@ -146,7 +147,6 @@ def fetch_news(stock_name):
 def filter_news(stock_name, items, exclude_words):
     valid_items = []
     
-    from datetime import timezone, timedelta
     KST = timezone(timedelta(hours=9))
     now = datetime.now(KST)
 
@@ -500,42 +500,62 @@ async def main_async():
     all_stock_names_set = set(stock_names)
 
     # 3. Crawl
-    for i, stock in enumerate(stock_names):
-        print(f"[{i+1} of {len(stock_names)}] Fetching {stock}...")
-        raw_items = fetch_news(stock)
-        
-        # [NEW] Enhanced Filtering for Overlapping Names (e.g. BGF vs BGFretail)
-        # Logic: If news title contains a 'longer stock name' that includes current 'stock', ignore it.
-        # Example: stock='BGF', title='BGF리테일 실적...', longer_stock='BGF리테일' -> Skip
-        
-        valid_items = []
-        # Pre-calculate longer stocks that contain current stock
-        longer_partners = [s for s in all_stock_names_set if stock in s and len(s) > len(stock)]
-        
-        temp_valid = filter_news(stock, raw_items, exclude_words)
-        
-        for item in temp_valid:
-            title = item['title']
-            is_noise = False
-            for partner in longer_partners:
-                if partner in title:
-                    # Found a longer stock name in title -> Likely news about that specific longer stock, not our short keyword
-                    is_noise = True
-                    break
+    semaphore = asyncio.Semaphore(5)
+    
+    async def process_stock(stock_idx, stock):
+        async with semaphore:
+            print(f"[{stock_idx+1} of {len(stock_names)}] Fetching {stock}...")
+            # API 제한 방지를 위해 약간의 대기시간 추가
+            await asyncio.sleep(0.1)
+            raw_items = await asyncio.to_thread(fetch_news, stock)
             
-            if not is_noise:
-                valid_items.append(item)
-        
-        if valid_items:
-            # Cluster BEFORE saving
-            clustered_items = cluster_similar_items(valid_items)
-            print(f"  > Found {len(valid_items)} items -> {len(clustered_items)} clusters.")
+            # [NEW] Enhanced Filtering for Overlapping Names (e.g. BGF vs BGFretail)
+            # Logic: If news title contains a 'longer stock name' that includes current 'stock', ignore it.
+            # Example: stock='BGF', title='BGF리테일 실적...', longer_stock='BGF리테일' -> Skip
             
-            save_to_history(clustered_items) # Save reps to Supabase History
+            valid_items = []
+            # Pre-calculate longer stocks that contain current stock
+            longer_partners = [s for s in all_stock_names_set if stock in s and len(s) > len(stock)]
+            
+            temp_valid = filter_news(stock, raw_items, exclude_words)
+            
+            for item in temp_valid:
+                title = item['title']
+                is_noise = False
+                for partner in longer_partners:
+                    if partner in title:
+                        # Found a longer stock name in title -> Likely news about that specific longer stock, not our short keyword
+                        is_noise = True
+                        break
+                
+                if not is_noise:
+                    valid_items.append(item)
+            
+            if valid_items:
+                # Cluster BEFORE saving
+                clustered_items = cluster_similar_items(valid_items)
+                print(f"  > Found {len(valid_items)} items for {stock} -> {len(clustered_items)} clusters.")
+                return clustered_items
+            return []
+
+    # 병렬로 전체 종목 검색
+    tasks = [process_stock(i, stock) for i, stock in enumerate(stock_names)]
+    results = await asyncio.gather(*tasks)
+    
+    # 50종목씩 묶어서 Supabase 저장 (DB Rate Limit/Transaction 방어)
+    # 1. 전체 결과 취합
+    for clustered_items in results:
+        if clustered_items:
             all_valid_news.extend(clustered_items)
+
+    # 2. Supabase 저장 (500개씩 청크)
+    if all_valid_news:
+        CHUNK_SIZE = 500
+        for i in range(0, len(all_valid_news), CHUNK_SIZE):
+            chunk = all_valid_news[i:i + CHUNK_SIZE]
+            print(f"Saving items [{i+1} ~ {i+len(chunk)}] to DB...")
+            await asyncio.to_thread(save_to_history, chunk)
             
-        time.sleep(0.1) # Rate limit
-        
     if not all_valid_news:
         print("No valid news found today.")
         # async with Bot(token=TELEGRAM_TOKEN) as bot:
@@ -566,7 +586,6 @@ async def main_async():
     
     # 6. Send Telegram
     # [NEW] Refined Telegram Message Logic (Clean & Bold)
-    from datetime import timezone
     KST = timezone(timedelta(hours=9))
     now = datetime.now(KST)
     am_pm = "오전" if now.hour < 12 else "오후"
@@ -906,7 +925,6 @@ def simple_markdown_to_notion_blocks(ai_summary, all_valid_news, keywords):
     return blocks
 
 async def send_notion_message(report_title, ai_summary, all_valid_news, keywords):
-    import urllib.request
     NOTION_API_KEY = os.getenv("notion")
     NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
     
@@ -918,7 +936,6 @@ async def send_notion_message(report_title, ai_summary, all_valid_news, keywords
 
     blocks = simple_markdown_to_notion_blocks(ai_summary, all_valid_news, keywords)
     
-    from datetime import timezone, timedelta
     KST = timezone(timedelta(hours=9))
     now = datetime.now(KST)
     today_str = now.strftime('%Y-%m-%d')
@@ -952,7 +969,6 @@ async def send_notion_message(report_title, ai_summary, all_valid_news, keywords
                 print(f"Notion 첫 페이지 생성 성공 (Block 1~{len(first_chunk)}).")
                 
                 # 2. Add remaining blocks iteratively (Chunking)
-                import time
                 if page_id and remaining_blocks:
                     for i in range(0, len(remaining_blocks), 100):
                         time.sleep(0.5) # Rate limit safety (초당 3회 허용 / 여기서는 0.5초 대기로 안전망 확보)
@@ -996,8 +1012,6 @@ async def send_gmail_message(subject, message_text, mime_type='plain'):
     
         # Send (Retry logic for Rate Limit Exceeded)
         # 429 에러(Rate Limit) 발생 시 잠시 대기
-        import time
-        from googleapiclient.errors import HttpError
         
         def send_api():
             try:
