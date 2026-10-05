@@ -10,6 +10,7 @@ import base64
 import urllib.request
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
+from collections import Counter
 from dotenv import load_dotenv
 
 from google.auth.transport.requests import Request
@@ -20,7 +21,7 @@ from googleapiclient.errors import HttpError
 
 # Third-party libraries
 from google import genai
-from telegram import Bot
+# from telegram import Bot
 
 try:
     import ctypes
@@ -54,51 +55,94 @@ TOKEN_FILE = os.path.join(BASE_DIR, '..', 'token.json')
 
 # File Paths relative to execution/
 DATA_DIR = os.path.join(BASE_DIR, '..', 'data')
-STOCK_NAMES_FILE = os.path.join(DATA_DIR, '종목명.json')
-EXCLUDE_WORDS_FILE = os.path.join(DATA_DIR, '제외단어.json')
+STOCK_NAMES_FILE = os.path.join(DATA_DIR, '종목명_public.json')
+EXCLUDE_WORDS_FILE = os.path.join(DATA_DIR, '제외단어_public.json')
 
 # Settings
 API_URL = "https://openapi.naver.com/v1/search/news.json"
 DISPLAY_COUNT = 100
 SIMILARITY_THRESHOLD = 0.6  # 0.0 ~ 1.0
+FILTER_VERSION = "noise-filter-metrics-v1"
 
 # --- Database Functions ---
 
+def get_supabase_client():
+    """Create a server-side Supabase client. Never print credentials."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    from supabase import create_client
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
 def save_to_history(items):
-    """Save processed items to persistent history DB (Supabase). Bulk upsert version."""
+    """Save processed items to persistent history DB (Supabase)."""
     if not items:
         return 0
-        
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        print("Warning: Supabase credentials not found. Skipping DB save.")
-        return 0
-        
+
     try:
-        from supabase import create_client, Client
-        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        
-        # 전체 리스트를 한 번에 upsert (title 중복 시 조용히 스킵)
+        supabase = get_supabase_client()
+        if supabase is None:
+            print("Warning: Supabase credentials not found. Skipping DB save.")
+            return 0
+
         data_list = [
             {
-                "stock_name": item['stock'],
-                "title": item['title'],
-                "pub_date": item['pub_date'],
-                "pub_time": item['pub_time'],
-                "link": item['link']
+                "stock_name": item["stock"],
+                "title": item["title"],
+                "pub_date": item["pub_date"],
+                "pub_time": item["pub_time"],
+                "link": item["link"],
             }
             for item in items
         ]
-        
         supabase.table("stack_news").upsert(
             data_list,
-            on_conflict="title",      # title이 같으면 충돌로 처리
-            ignore_duplicates=True    # 충돌 시 에러 없이 무시
+            on_conflict="link",
+            ignore_duplicates=True,
         ).execute()
-        
         return len(data_list)
     except Exception as e:
         print(f"Supabase Client Error: {type(e).__name__}")
         return 0
+
+
+def save_pipeline_run_metrics(metrics):
+    """Store one aggregate metrics row for the current crawler run."""
+    try:
+        supabase = get_supabase_client()
+        if supabase is None:
+            print("Warning: Supabase credentials not found. Skipping metrics save.")
+            return False
+
+        payload = {
+            "github_run_id": os.getenv("GITHUB_RUN_ID"),
+            "github_sha": os.getenv("GITHUB_SHA"),
+            "filter_version": FILTER_VERSION,
+            "model_name": metrics.get("model_name"),
+            "fetched_count": metrics.get("fetched_count", 0),
+            "baseline_news_count": metrics.get("baseline_news_count", 0),
+            "keyword_excluded_count": metrics.get("keyword_excluded_count", 0),
+            "before_dedup_count": metrics.get("before_dedup_count", 0),
+            "duplicate_removed_count": metrics.get("duplicate_removed_count", 0),
+            "after_dedup_count": metrics.get("after_dedup_count", 0),
+            "llm_input_news_count": metrics.get("llm_input_news_count", 0),
+            "baseline_input_tokens": metrics.get("baseline_input_tokens"),
+            "actual_counted_input_tokens": metrics.get("actual_counted_input_tokens"),
+            "actual_input_tokens": metrics.get("actual_input_tokens"),
+            "input_tokens_saved": metrics.get("input_tokens_saved"),
+            "input_token_reduction_pct": metrics.get("input_token_reduction_pct"),
+            "output_tokens": metrics.get("output_tokens"),
+            "thought_tokens": metrics.get("thought_tokens"),
+            "total_tokens": metrics.get("total_tokens"),
+            "filter_reason_counts": metrics.get("filter_reason_counts", {}),
+            "excluded_keyword_counts": metrics.get("excluded_keyword_counts", {}),
+        }
+        supabase.table("pipeline_run_metrics").insert(payload).execute()
+        print("[METRICS] pipeline_run_metrics 저장 완료")
+        return True
+    except Exception as e:
+        print(f"[METRICS] 저장 실패: {type(e).__name__}: {e}")
+        return False
 
 
 
@@ -137,76 +181,85 @@ def fetch_news(stock_name):
         "sort": "date"
     }
     try:
-        response = requests.get(API_URL, headers=headers, params=params)
+        response = requests.get(API_URL, headers=headers, params=params, timeout=10)
         response.raise_for_status()
         return response.json().get('items', [])
     except Exception as e:
         print(f"Error fetching {stock_name}: {e}")
         return []
 
-def filter_news(stock_name, items, exclude_words):
+def filter_news(stock_name, items, exclude_words, longer_partners):
+    """Return post-filter items, pre-noise-filter baseline items, and reason counts."""
     valid_items = []
-    
+    baseline_items = []
+    filter_counts = Counter()
+    excluded_keyword_counts = Counter()
+
     KST = timezone(timedelta(hours=9))
-    now = datetime.now(KST)
+    cutoff_time = datetime.now(KST) - timedelta(hours=12)
+    blocked_domains = [
+        "sports.news.naver.com", "m.sports.naver.com",
+        "entertain.naver.com", "m.entertain.naver.com",
+        "post.naver.com", "tv.naver.com",
+    ]
+    allowed_tags = ["단독", "속보", "특징주", "공시"]
 
-    cutoff_time = now - timedelta(hours=12)
-    
     for item in items:
-        title = clean_html(item['title'])
-        link = item['link']
-        
-        # [NEW] Non-News Domain Filter
-        # Exclude sports, entertainment, Naver Post(UGC), and Naver TV(Video)
-        blocked_domains = [
-            'sports.news.naver.com', 'm.sports.naver.com',
-            'entertain.naver.com', 'm.entertain.naver.com',
-            'post.naver.com', 'tv.naver.com'
-        ]
-        if any(domain in link for domain in blocked_domains):
-            continue
-        
-        # 0. [ ] 태그 필터링
-        brackets = re.findall(r'\[(.*?)\]', title)
-        skip = False
-        allowed_tags = ["단독", "속보", "특징주", "공시"]
-        for tag in brackets:
-            if tag not in allowed_tags:
-                skip = True
-                break
-        if skip:
-            continue
-        
-        # 1. Check strict 12h window
-        dt = parse_pub_date(item['pubDate'])
+        title = clean_html(item.get("title", ""))
+        link = item.get("link") or item.get("originallink") or ""
+        dt = parse_pub_date(item.get("pubDate", ""))
+
+        # Eligibility rules are excluded from the token baseline because these
+        # records cannot be part of the 12-hour stock-news report.
         if dt is None:
+            filter_counts["invalid_date"] += 1
             continue
-            
         if dt < cutoff_time:
+            filter_counts["outside_12h"] += 1
             continue
-
-        # 2. Check Excluded Words
-        is_exact = False
-        for word in exclude_words:
-            if word in title:
-                is_exact = True
-                break
-        if is_exact:
+        if not re.search(r"[ㄱ-ㅎㅏ-ㅣ가-힣]", title):
+            filter_counts["non_korean"] += 1
             continue
-
-        # 3. Check Stock Name in Title
         if stock_name not in title:
+            filter_counts["stock_name_missing"] += 1
             continue
-            
-        valid_items.append({
-            'stock': stock_name,
-            'title': title,
-            'link': link,
-            'pub_date': dt.strftime("%Y-%m-%d"),
-            'pub_time': dt.strftime("%H:%M:%S")
-        })
-        
-    return valid_items
+        if any(partner in title for partner in longer_partners):
+            filter_counts["longer_stock_name"] += 1
+            continue
+
+        candidate = {
+            "stock": stock_name,
+            "title": title,
+            "link": link,
+            "pub_date": dt.strftime("%Y-%m-%d"),
+            "pub_time": dt.strftime("%H:%M:%S"),
+        }
+        baseline_items.append(candidate.copy())
+
+        # Noise filters measured against the baseline above.
+        if any(domain in link for domain in blocked_domains):
+            filter_counts["blocked_domain"] += 1
+            continue
+
+        brackets = re.findall(r"\[(.*?)\]", title)
+        if any(tag not in allowed_tags for tag in brackets):
+            filter_counts["disallowed_bracket_tag"] += 1
+            continue
+
+        matched_keyword = next((word for word in exclude_words if word in title), None)
+        if matched_keyword:
+            filter_counts["excluded_keyword"] += 1
+            excluded_keyword_counts[matched_keyword] += 1
+            continue
+
+        valid_items.append(candidate)
+
+    return (
+        valid_items,
+        baseline_items,
+        dict(filter_counts),
+        dict(excluded_keyword_counts),
+    )
 
 def get_clean_tokens(text):
     """특수문자 제거 후 2글자 이상 단어만 추출 (집합 set 반환)"""
@@ -331,90 +384,166 @@ def format_news_report(all_items, keywords):
 
     return "\n".join(report_lines), "\n".join(summary_input)
 
-async def generate_ai_summary(news_text_list, historical_data_text):
-    """Generate summary using Gemini (New SDK) with historical data."""
+async def generate_ai_summary(news_text_list, baseline_news_text):
+    """Count pre/post-filter input tokens and generate only the post-filter report."""
+    empty_metrics = {
+        "model_name": None,
+        "baseline_input_tokens": None,
+        "actual_counted_input_tokens": None,
+        "actual_input_tokens": None,
+        "input_tokens_saved": None,
+        "input_token_reduction_pct": None,
+        "output_tokens": None,
+        "thought_tokens": None,
+        "total_tokens": None,
+    }
     if not GEMINI_API_KEY:
-        return "Gemini API Key missing."
-    
+        return "Gemini API Key missing.", empty_metrics
     if not news_text_list:
-        return "No news to summarize."
+        return "No news to summarize.", empty_metrics
 
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
-        
         prompt = f"""
 # Role (역할)
-당신은 '주식 테마 매칭 전문 AI'입니다. 과거 급등 사례(Low-Data)와 금일 뉴스(Input)를 비교하여, 유사한 상승 재료를 포착하는 것이 임무입니다.
-
+당신은 대한민국 주식 시장의 모멘텀과 테마주를 분석하는 '수석 퀀트 애널리스트'입니다. 
 
 # Context (맥락)
-나는 두 가지 텍스트 데이터를 제공합니다.
-1. [특징주.csv]: 과거 급등 종목의 '상승 이유'가 적힌 데이터입니다. (CSV 형식: 종목명, 최대 등락률, 최소 등락률, 이유)
-2. [Today]: 오늘 발생한 뉴스 헤드라인 목록입니다.
+제공되는 데이터는 오늘 발생한 주요 뉴스 헤드라인과 본문 요약본([Today])입니다.
 
-# Task
-[Today]를 분석하여, [특징주.csv]에 있는 **상승 논리와 부합하는 뉴스**를 찾아내십시오.
+# Task (임무)
+[Today] 데이터를 분석하여, 내일 주식 시장에서 **강력한 주가 상승 모멘텀(테마)으로 작용할 수 있는 핵심 뉴스**를 선별하십시오.
 
 # Analysis Logic (분석 로직)
-1. **패턴 매칭**: [Today]에서 [특징주.csv]의 '이유'에 포함된 종목명을 제외한 키워드나 유사한 맥락이 발견되면 포착하십시오.
-2. **이유 기반 추론**: 과거의 상승 논리가 오늘 뉴스에도 적용 가능한지 판단하십시오. (종목명과 상관없이 상승 이유에 집중해주세요.)
-3. **주의: 문맥 확인 (Context Check)**:
-   - 키워드가 맞지 않거나 맥락이 유사하지 않음에도 억지로 끼워 맞추지 마십시오. 논리적 타당성이 있어야 합니다.
-   - 유사한 맥락에 맞게 포착됐는지 다시 확인하세요. 
-   - 특징주.csv(과거 데이터)에 해당하는 이유가 없으면 "금일 주식에 영향을 미치는 종목 뉴스는 없습니다!" 라고 작성
+1. **파급력 평가**: 단순한 기업 홍보(예: 일상적인 게임 업데이트, 단순 MOU 체결, 팝업스토어 오픈)는 철저히 배제하십시오. 
+2. **핵심 재료 포착**: 실질적인 매출 증가, 대규모 수주, 정부 정책 수혜, FDA 등 주요 기관 승인, M&A 등 주가를 움직일 만한 '강력한 재료'에 집중하십시오.
+3. **엄격한 필터링**: 억지로 테마를 만들어내지 마십시오. 파급력이 높은 뉴스가 없다면 "금일 주식에 유의미한 영향을 미칠 강력한 재료는 포착되지 않았습니다."라고 출력하십시오.
 
 # Input Data
-[특징주.csv]
-{historical_data_text}
-
 [Today]
 {news_text_list}
 
 # Output Format (출력 형식 - 중요)
-결과는 메일로 발송할 것이므로, 아래 양식에 맞춰 가독성 좋은 '보고서 형태'로 작성해 주세요. 서론이나 코드는 제외하고 본문만 출력하세요. 
+결과는 메일로 발송할 것입니다. 아래 마크다운 양식에 맞춰 가독성 좋은 '보고서 형태'로 작성해 주세요. 서론이나 부가 설명은 생략하십시오.
 
+## 📢 오늘의 종목 분석 (종목 개수에 제한 받지 말고 포착된 종목 모두 포함해줘)
 
-## 📢 오늘의 종목 분석 (종목 개수에 제한 받지 말고 [특징주.csv]에 있는 '이유'와 부합하거나 유사한 모든 뉴스와 종목을 가져오세요)
-
-### 1. [종목명] (예상 테마: 000, 관련 종목 :  000,000 ([종목명]이외, 7개 이내로 작성, 없으면 빈칸))
+### 1.  [종목명] (예상 테마: 000, 관련 종목 :  000,000 ([종목명]이외, 7개 이내로 작성, 없으면 빈칸))
 **뉴스** : **"오늘 뉴스 제목 인용"  (뉴스 발행 시간 인용)**
 과거 상승 이유 : "과거 종목의 상승 이유 인용"
 예상 파급력 : **높음**/**중간**/**낮음** 
-▶ (search를 통해 오늘 뉴스가 어떨 지 간략하게 요약 설명 (서술식으로 표현하지 말 것))
+분석 및 상승 논리 : 해당 뉴스가 왜 주가 상승으로 이어질 수 있는지 경제적, 산업적 맥락에서 2문장 이내로 간략히 요약 (서술식 배제, 명사형 종결 사용)
 
 (포착 항목 동일 양식 반복)
 
+---
+
 ## 💡 요약 및 투자 포인트
-
-전체적인 시장 분위기와 오늘 포착된 종목들의 공통적인 테마 흐름을 단답형으로 간략하게 3줄 요약(# 1. # 2. #3. 순서로 작성)(마크 다운 형식 넣지 말 것)
-
+# 1. (오늘 시장의 전반적인 특징 요약)
+# 2. (주목해야 할 특정 섹터 흐름)
+# 3. (리스크 요인 또는 특이사항)
 """
-        models_to_try = [
-            "gemini-3-flash-preview", 
-            "gemini-3-flash-preview", 
-            "gemini-2.5-flash"
+        baseline_prompt = prompt.replace(news_text_list, baseline_news_text, 1)
+        # Model quality order comes from the offline evaluation.
+        # Retry counts are kept separate from model priority so the operational
+        # fallback policy is explicit: 3.7 once, 3.8 once, 3.5 twice, 3.6 once.
+        model_plan = [
+            ("gemini-3.7-flash", 1),
+            ("gemini-3.8-flash", 1),
+            ("gemini-3.5-flash", 2),
+            ("gemini-3.6-flash", 1),
         ]
-        
+        model_attempt_limits = dict(model_plan)
+        models_to_try = [
+            model_name
+            for model_name, attempt_count in model_plan
+            for _ in range(attempt_count)
+        ]
+        model_attempt_counts = Counter()
+
         for attempt, model_name in enumerate(models_to_try):
+            model_attempt_counts[model_name] += 1
+            current_model_attempt = model_attempt_counts[model_name]
+            max_model_attempts = model_attempt_limits[model_name]
+            baseline_count = None
+            actual_count = None
             try:
-                # Run synchronous call in a thread to allow asyncio to yield
+                baseline_response, actual_response = await asyncio.gather(
+                    asyncio.to_thread(
+                        client.models.count_tokens,
+                        model=model_name,
+                        contents=baseline_prompt,
+                    ),
+                    asyncio.to_thread(
+                        client.models.count_tokens,
+                        model=model_name,
+                        contents=prompt,
+                    ),
+                )
+                baseline_count = getattr(baseline_response, "total_tokens", None)
+                actual_count = getattr(actual_response, "total_tokens", None)
+                print(
+                    f"[TOKEN COUNT] model={model_name}, "
+                    f"before_filter={baseline_count}, after_filter={actual_count}"
+                )
+            except Exception as count_error:
+                print(
+                    f"[TOKEN COUNT] {model_name} 계산 실패. "
+                    f"보고서 생성은 계속합니다: {type(count_error).__name__}"
+                )
+
+            try:
+                # Only the post-filter prompt generates a report.
                 response = await asyncio.to_thread(
                     client.models.generate_content,
-                    model=model_name, 
+                    model=model_name,
                     contents=prompt,
-                    config=genai.types.GenerateContentConfig(temperature=0.0)
+                    config=genai.types.GenerateContentConfig(temperature=0.0),
                 )
-                return response.text
-                
+                usage = response.usage_metadata
+                actual_input_tokens = getattr(usage, "prompt_token_count", 0) or 0
+                output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+                thought_tokens = getattr(usage, "thoughts_token_count", 0) or 0
+                total_tokens = getattr(usage, "total_token_count", 0) or 0
+
+                saved = None
+                reduction_pct = None
+                if baseline_count is not None and actual_count is not None:
+                    saved = baseline_count - actual_count
+                    if baseline_count:
+                        reduction_pct = round(saved / baseline_count * 100, 4)
+
+                metrics = {
+                    "model_name": model_name,
+                    "baseline_input_tokens": baseline_count,
+                    "actual_counted_input_tokens": actual_count,
+                    "actual_input_tokens": actual_input_tokens,
+                    "input_tokens_saved": saved,
+                    "input_token_reduction_pct": reduction_pct,
+                    "output_tokens": output_tokens,
+                    "thought_tokens": thought_tokens,
+                    "total_tokens": total_tokens,
+                }
+                print(
+                    f"[TOKEN USAGE] model={model_name}, input={actual_input_tokens}, "
+                    f"output={output_tokens}, thoughts={thought_tokens}, total={total_tokens}"
+                )
+                print(f"[Gemini] 필터 후 뉴스로 보고서 1개 생성: {len(news_text_list)}자")
+                return response.text, metrics
             except Exception as e:
                 if attempt == len(models_to_try) - 1:
-                    return f"AI Summary Failed after trying all models: {e}"
-                
-                print(f"[알림] {model_name} 서버 지연 등 오류 발생. 10초 대기 후 다음 시도로 넘어갑니다... ({e})")
+                    return (
+                        f"AI Summary Failed after trying all models: {e}",
+                        empty_metrics,
+                    )
+                print(
+                    f"[알림] {model_name} 오류 발생 "
+                    f"(시도 {current_model_attempt}/{max_model_attempts}). "
+                    f"10초 대기 후 다음 시도로 넘어갑니다... ({type(e).__name__})"
+                )
                 await asyncio.sleep(10)
-                
     except Exception as e:
-        return f"AI Summary Failed: {e}"
+        return f"AI Summary Failed: {e}", empty_metrics
 
 def get_gmail_service():
     creds = None
@@ -459,20 +588,20 @@ def get_gmail_service():
 
 
 
-async def send_telegram_message(bot, chat_id, message):
-    """Send message to Telegram, splitting if too long."""
-    MAX_LENGTH = 4000
-    
-    try:
-        if len(message) <= MAX_LENGTH:
-            await bot.send_message(chat_id=chat_id, text=message, parse_mode='HTML') # Use HTML for stability
-        else:
-            # Simple split
-            parts = [message[i:i+MAX_LENGTH] for i in range(0, len(message), MAX_LENGTH)]
-            for part in parts:
-                await bot.send_message(chat_id=chat_id, text=part)
-    except Exception as e:
-        print(f"Telegram Error: {e}")
+# async def send_telegram_message(bot, chat_id, message):
+#     """Send message to Telegram, splitting if too long."""
+#     MAX_LENGTH = 4000
+#     
+#     try:
+#         if len(message) <= MAX_LENGTH:
+#             await bot.send_message(chat_id=chat_id, text=message, parse_mode='HTML') # Use HTML for stability
+#         else:
+#             # Simple split
+#             parts = [message[i:i+MAX_LENGTH] for i in range(0, len(message), MAX_LENGTH)]
+#             for part in parts:
+#                 await bot.send_message(chat_id=chat_id, text=part)
+#     except Exception as e:
+#         print(f"Telegram Error: {e}")
 
 async def main_async():
     # 0. Check Keys
@@ -480,14 +609,15 @@ async def main_async():
         print("Missing API Keys in .env")
         return
 
-    print("--- Starting News Crawler ---")
+    script_start_time = time.time()
+    print(f"--- Starting News Crawler --- [{datetime.now(timezone(timedelta(hours=9))).strftime('%H:%M:%S')}]")
     
     # 2. Load Data
     stock_names = load_json(STOCK_NAMES_FILE)
     exclude_words = load_json(EXCLUDE_WORDS_FILE)
     
     # [NEW] Load Keywords for Highlighting
-    KEYWORD_FILE = os.path.join(DATA_DIR, '종목명_keyword.json')
+    KEYWORD_FILE = os.path.join(DATA_DIR, '종목명_keyword_public.json')
     keywords = load_json(KEYWORD_FILE)
     
     print(f"Stocks: {len(stock_names)}, Excluded Words: {len(exclude_words)}, Keywords: {len(keywords)}")
@@ -504,85 +634,105 @@ async def main_async():
     
     async def process_stock(stock_idx, stock):
         async with semaphore:
-            print(f"[{stock_idx+1} of {len(stock_names)}] Fetching {stock}...")
+            stock_start = time.time()
+            print(f"[{stock_idx+1} of {len(stock_names)}] Fetching {stock}... [{datetime.now(timezone(timedelta(hours=9))).strftime('%H:%M:%S')}]")
             # API 제한 방지를 위해 약간의 대기시간 추가
             await asyncio.sleep(0.1)
             raw_items = await asyncio.to_thread(fetch_news, stock)
-            
-            # [NEW] Enhanced Filtering for Overlapping Names (e.g. BGF vs BGFretail)
-            # Logic: If news title contains a 'longer stock name' that includes current 'stock', ignore it.
-            # Example: stock='BGF', title='BGF리테일 실적...', longer_stock='BGF리테일' -> Skip
-            
-            valid_items = []
-            # Pre-calculate longer stocks that contain current stock
-            longer_partners = [s for s in all_stock_names_set if stock in s and len(s) > len(stock)]
-            
-            temp_valid = filter_news(stock, raw_items, exclude_words)
-            
-            for item in temp_valid:
-                title = item['title']
-                is_noise = False
-                for partner in longer_partners:
-                    if partner in title:
-                        # Found a longer stock name in title -> Likely news about that specific longer stock, not our short keyword
-                        is_noise = True
-                        break
-                
-                if not is_noise:
-                    valid_items.append(item)
-            
-            if valid_items:
-                # Cluster BEFORE saving
-                clustered_items = cluster_similar_items(valid_items)
-                print(f"  > Found {len(valid_items)} items for {stock} -> {len(clustered_items)} clusters.")
-                return clustered_items
-            return []
+            longer_partners = [
+                name for name in all_stock_names_set
+                if stock in name and len(name) > len(stock)
+            ]
+            (
+                valid_items,
+                baseline_items,
+                filter_counts,
+                excluded_keyword_counts,
+            ) = filter_news(stock, raw_items, exclude_words, longer_partners)
+
+            clustered_items = cluster_similar_items(valid_items)
+            elapsed = time.time() - stock_start
+            duplicate_removed = len(valid_items) - len(clustered_items)
+            print(
+                f"  > [{stock}] baseline={len(baseline_items)}, "
+                f"after_filter={len(valid_items)}, clusters={len(clustered_items)} "
+                f"({elapsed:.1f}s)"
+            )
+            return {
+                "fetched_count": len(raw_items),
+                "baseline_items": baseline_items,
+                "before_dedup_count": len(valid_items),
+                "duplicate_removed_count": duplicate_removed,
+                "clustered_items": clustered_items,
+                "filter_reason_counts": filter_counts,
+                "excluded_keyword_counts": excluded_keyword_counts,
+            }
 
     # 병렬로 전체 종목 검색
     tasks = [process_stock(i, stock) for i, stock in enumerate(stock_names)]
     results = await asyncio.gather(*tasks)
-    
-    # 50종목씩 묶어서 Supabase 저장 (DB Rate Limit/Transaction 방어)
-    # 1. 전체 결과 취합
-    for clustered_items in results:
-        if clustered_items:
-            all_valid_news.extend(clustered_items)
 
-    # 2. Supabase 저장 (500개씩 청크)
+    baseline_news = []
+    filter_reason_counts = Counter()
+    excluded_keyword_counts = Counter()
+    fetched_count = 0
+    before_dedup_count = 0
+    duplicate_removed_count = 0
+
+    for result in results:
+        fetched_count += result["fetched_count"]
+        baseline_news.extend(result["baseline_items"])
+        before_dedup_count += result["before_dedup_count"]
+        duplicate_removed_count += result["duplicate_removed_count"]
+        all_valid_news.extend(result["clustered_items"])
+        filter_reason_counts.update(result["filter_reason_counts"])
+        excluded_keyword_counts.update(result["excluded_keyword_counts"])
+
+    pipeline_metrics = {
+        "fetched_count": fetched_count,
+        "baseline_news_count": len(baseline_news),
+        "keyword_excluded_count": filter_reason_counts.get("excluded_keyword", 0),
+        "before_dedup_count": before_dedup_count,
+        "duplicate_removed_count": duplicate_removed_count,
+        "after_dedup_count": len(all_valid_news),
+        "llm_input_news_count": len(all_valid_news),
+        "filter_reason_counts": dict(filter_reason_counts),
+        "excluded_keyword_counts": dict(excluded_keyword_counts),
+    }
+
+    # Supabase 저장 (500개씩 청크)
     if all_valid_news:
-        CHUNK_SIZE = 500
-        for i in range(0, len(all_valid_news), CHUNK_SIZE):
-            chunk = all_valid_news[i:i + CHUNK_SIZE]
+        chunk_size = 500
+        for i in range(0, len(all_valid_news), chunk_size):
+            chunk = all_valid_news[i:i + chunk_size]
             print(f"Saving items [{i+1} ~ {i+len(chunk)}] to DB...")
             await asyncio.to_thread(save_to_history, chunk)
-            
+
     if not all_valid_news:
         print("No valid news found today.")
-        # async with Bot(token=TELEGRAM_TOKEN) as bot:
-        #     await send_telegram_message(bot, TELEGRAM_CHAT_ID, "금일 수집된 중요 뉴스가 없습니다.")
+        await asyncio.to_thread(save_pipeline_run_metrics, pipeline_metrics)
         return
 
-    # ... (Step 4, 5 same as before) ...
-    # 4. Prepare Report (Already Clustered)
+    crawl_elapsed = time.time() - script_start_time
+    print(f"\n[TIME] 크롤링 완료: {crawl_elapsed:.1f}s ({len(all_valid_news)}개 뉴스 수집)")
+
+    # 4. Prepare the pre-filter baseline and post-filter report inputs.
     print("Preparing report...")
+    _, baseline_summary_input_str = format_news_report(baseline_news, keywords)
     news_report_body, summary_input_str = format_news_report(all_valid_news, keywords)
-    
-    # 5. Generate AI Summary with Historical Data
-    print("Generating AI Summary...")
-    
-    HISTORICAL_CSV_PATH = os.path.join(BASE_DIR, '..', 'data', '특징주.csv')
-    historical_text = "과거 데이터 없음"
-    
-    if os.path.exists(HISTORICAL_CSV_PATH):
-        try:
-            with open(HISTORICAL_CSV_PATH, 'r', encoding='utf-8-sig') as f:
-                historical_text = f.read()
-            print(f"Loaded historical data ({len(historical_text)} chars).")
-        except Exception as e:
-            print(f"Failed to load historical data: {e}")
-            
-    ai_summary = await generate_ai_summary(summary_input_str, historical_text)
-    # save_summary(ai_summary) # Removed
+
+    # 5. Count both prompts, but generate only one post-filter report.
+    print("Counting tokens and generating AI Summary...")
+    gemini_start = time.time()
+    ai_summary, token_metrics = await generate_ai_summary(
+        summary_input_str,
+        baseline_summary_input_str,
+    )
+    gemini_elapsed = time.time() - gemini_start
+    print(f"[TIME] Gemini API 완료: {gemini_elapsed:.1f}s")
+
+    pipeline_metrics.update(token_metrics)
+    await asyncio.to_thread(save_pipeline_run_metrics, pipeline_metrics)
     
     # 6. Send Telegram
     # [NEW] Refined Telegram Message Logic (Clean & Bold)
@@ -592,54 +742,52 @@ async def main_async():
     formatted_date = now.strftime('%y.%m.%d')
     report_title = f"{formatted_date} {am_pm} 종목 뉴스 브리핑"
 
-    tg_lines = []
-    tg_lines.append(f"📊 *{report_title}*")
-    tg_lines.append(f"{now.strftime('%Y-%m-%d %H:%M')}\n")
-    
-    source_lines = ai_summary.split('\n')
-    for line in source_lines:
-        line = line.strip()
-        if not line:
-             tg_lines.append("") # Keep empty lines for spacing
-             continue
-        
-        # [수정된 로직] Allow-List 방식 (허용된 패턴만 통과)
-        # 사족(설명)을 완벽하게 제거하기 위함.
-        
-        # 1. 헤더/종목명 (### 1. ...)
-        if "### 1." in line or "### " in line:
-             clean_line = line.replace("### ", "").replace("**", "")
-             clean_line = clean_line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-             tg_lines.append(f"<b>{clean_line}</b>")
-             
-        # 2. 뉴스 제목 (* 뉴스: ...)
-        elif "뉴스" in line and ":" in line:
-             # "과거 뉴스"는 제외해야 함
-             if "과거 뉴스" in line:
-                 continue
-                 
-             clean_line = line.replace("**", "")
-             clean_line = clean_line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-             tg_lines.append(clean_line)
-             
-        # 3. 그 외 설명문(사족) -> 과감히 삭제 (continue)
-        else:
-             continue
+    # tg_lines = []
+    # tg_lines.append(f"📊 *{report_title}*")
+    # tg_lines.append(f"{now.strftime('%Y-%m-%d %H:%M')}\n")
+    # 
+    # source_lines = ai_summary.split('\n')
+    # for line in source_lines:
+    #     line = line.strip()
+    #     if not line:
+    #          tg_lines.append("") # Keep empty lines for spacing
+    #          continue
+    #     
+    #     # [수정된 로직] Allow-List 방식 (허용된 패턴만 통과)
+    #     # 사족(설명)을 완벽하게 제거하기 위함.
+    #     
+    #     # 1. 헤더/종목명 (### 1. ...)
+    #     if "### 1." in line or "### " in line:
+    #          clean_line = line.replace("### ", "").replace("**", "")
+    #          clean_line = clean_line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    #          tg_lines.append(f"<b>{clean_line}</b>")
+    #          
+    #     # 2. 뉴스 제목 (* 뉴스: ...)
+    #     elif "뉴스" in line and ":" in line:
+    #          # "과거 뉴스"는 제외해야 함
+    #          if "과거 뉴스" in line:
+    #              continue
+    #              
+    #          clean_line = line.replace("**", "")
+    #          clean_line = clean_line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    #          tg_lines.append(clean_line)
+    #          
+    #     # 3. 그 외 설명문(사족) -> 과감히 삭제 (continue)
+    #     else:
+    #          continue
 
-    tg_message = "\n".join(tg_lines)
-    
-    print("Sending Telegram message...")
-    async with Bot(token=TELEGRAM_TOKEN) as bot:
-         # Use HTML parse mode for better stability
-        await send_telegram_message(bot, TELEGRAM_CHAT_ID, tg_message)
-    print("Done!")
+    # tg_message = "\n".join(tg_lines)
+    # 
+    # telegram_start = time.time()
+    # print("Sending Telegram message...")
+    # async with Bot(token=TELEGRAM_TOKEN) as bot:
+    #      # Use HTML parse mode for better stability
+    #     await send_telegram_message(bot, TELEGRAM_CHAT_ID, tg_message)
+    # telegram_elapsed = time.time() - telegram_start
+    # print(f"[TIME] Telegram 완료: {telegram_elapsed:.1f}s")
 
-    # 7. Send Notion (Blocks API)
-    print("Sending Notion...")
-    await send_notion_message(report_title, ai_summary, all_valid_news, keywords)
-    print("Done!")
-
-    # 8. Send Gmail (Simple HTML)
+    # 7. Send Gmail (Simple HTML)
+    gmail_start = time.time()
     print("Sending Gmail...")
     
     # [Simple HTML Converter]
@@ -738,8 +886,35 @@ async def main_async():
     
     # Send as HTML (OAuth)
     await send_gmail_message(email_subject, html_message, mime_type='html')
+    gmail_elapsed = time.time() - gmail_start
+    print(f"[TIME] Gmail 완료: {gmail_elapsed:.1f}s")
 
-def simple_markdown_to_notion_blocks(ai_summary, all_valid_news, keywords):
+    # 8. Send Notion (Blocks API)
+    notion_start = time.time()
+    print("Sending Notion...")
+    try:
+        # 노션 업로드에 3분(180초) 타임아웃 설정
+        await asyncio.wait_for(send_notion_message(report_title, ai_summary), timeout=180)
+        notion_elapsed = time.time() - notion_start
+        print(f"[TIME] Notion 완료: {notion_elapsed:.1f}s")
+    except asyncio.TimeoutError:
+        print("Notion 전송 작업이 3분을 초과하여 강제 종료되었습니다.")
+        notion_elapsed = time.time() - notion_start
+    except Exception as e:
+        print(f"Notion Error in Main: {e}")
+        notion_elapsed = time.time() - notion_start
+
+    total_elapsed = time.time() - script_start_time
+    print(f"\n===== 전체 실행 완료 =====")
+    print(f"[TIME] 크롤링:    {crawl_elapsed:.1f}s")
+    print(f"[TIME] Gemini:    {gemini_elapsed:.1f}s")
+    # print(f"[TIME] Telegram:  {telegram_elapsed:.1f}s")
+    print(f"[TIME] Notion:    {notion_elapsed:.1f}s")
+    print(f"[TIME] Gmail:     {gmail_elapsed:.1f}s")
+    print(f"[TIME] 총 소요:   {total_elapsed:.1f}s ({total_elapsed/60:.1f}분)")
+    print(f"=========================")
+
+def simple_markdown_to_notion_blocks(ai_summary):
     blocks = []
     
     lines = ai_summary.split('\n')
@@ -757,7 +932,6 @@ def simple_markdown_to_notion_blocks(ai_summary, all_valid_news, keywords):
         if line.startswith('## '):
             content = line.replace('## ', '').replace('**', '')
             blocks.append({
-                # ▼ 글자 크기 조절 원하실 경우: "heading_1"(가장 큼), "heading_2"(큼), "heading_3"(중간), "paragraph"(일반 본문) 중 하나로 "type"과 키를 변경하세요.
                 "object": "block", "type": "heading_1",
                 "heading_1": {"rich_text": [{"type": "text", "text": {"content": content}}]}
             })
@@ -769,7 +943,6 @@ def simple_markdown_to_notion_blocks(ai_summary, all_valid_news, keywords):
             meta_part = f"({parts[1]}" if len(parts) > 1 else ""
             
             # 1. 종목명 (메일 원본처럼 굵고 큰 제목 유지)
-            # ▼ 글자 크기 조절: "heading_3"를 "heading_2" 로 바꾸면 더 커집니다.
             blocks.append({
                 "object": "block", "type": "heading_3",
                 "heading_3": { "rich_text": [{"type": "text", "text": {"content": title_part}}], "is_toggleable": False }
@@ -867,64 +1040,9 @@ def simple_markdown_to_notion_blocks(ai_summary, all_valid_news, keywords):
                      "paragraph": {"rich_text": [{"type": "text", "text": {"content": content}}]}
                  })
                  
-    # 2. Append News List
-    blocks.append({"object": "block", "type": "divider", "divider": {}})
-    blocks.append({
-        "object": "block", "type": "heading_2",
-        "heading_2": {"rich_text": [{"type": "text", "text": {"content": "📰 수집된 전체 뉴스 목록"}}]}
-    })
-    
-    stock_map = {}
-    for item in all_valid_news:
-        s = item['stock']
-        if s not in stock_map:
-            stock_map[s] = []
-        stock_map[s].append(item)
-        
-    for stock, items in stock_map.items():
-        if not items: continue
-        
-        # [NEW 필터링 로직] 노션에는 중요 뉴스(형광펜 대상)만 선별해서 보냅니다.
-        important_items = []
-        for i in items:
-            title_without_stock = i['title'].replace(stock, "")
-            if any(kw in title_without_stock for kw in keywords):
-                important_items.append(i)
-                
-        # 중요 뉴스가 1개도 없는 종목이면 노션 전송 목록에서 통째로 제외합니다.
-        if not important_items:
-            continue
-            
-        important_items.sort(key=lambda x: (x.get('pub_date', ''), x.get('pub_time', '')), reverse=True)
-        
-        blocks.append({
-            "object": "block", "type": "heading_3",
-            "heading_3": {"rich_text": [{"type": "text", "text": {"content": f"[{stock}]"}}]}
-        })
-        
-        # 일반 뉴스는 버리고 중요 뉴스(important_items)만 노션 블록으로 생성합니다.
-        for item in important_items:
-            title = item['title']
-            date_str = item['pub_date'][5:] 
-            time_str = item['pub_time'][:5]
-            
-            # important_items 배열에 들어왔다는 것 자체가 이미 하이라이트 조건을 만족한 뉴스입니다.
-            color = "yellow_background"
-            
-            blocks.append({
-                "object": "block", "type": "bulleted_list_item",
-                "bulleted_list_item": {
-                    "rich_text": [
-                        {"type": "text", "text": {"content": f"{title} "}},
-                        {"type": "text", "text": {"content": f"({date_str} {time_str})"}, "annotations": {"color": "gray"}}
-                    ],
-                    "color": color
-                }
-            })
-            
     return blocks
 
-async def send_notion_message(report_title, ai_summary, all_valid_news, keywords):
+async def send_notion_message(report_title, ai_summary):
     NOTION_API_KEY = os.getenv("notion")
     NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
     
@@ -934,7 +1052,7 @@ async def send_notion_message(report_title, ai_summary, all_valid_news, keywords
         'Content-Type': 'application/json'
     }
 
-    blocks = simple_markdown_to_notion_blocks(ai_summary, all_valid_news, keywords)
+    blocks = simple_markdown_to_notion_blocks(ai_summary)
     
     KST = timezone(timedelta(hours=9))
     now = datetime.now(KST)
@@ -961,8 +1079,10 @@ async def send_notion_message(report_title, ai_summary, all_valid_news, keywords
     )
     
     def send_api():
+        start_time = time.time()  # 시작 시간 기록
+        timeout_limit = 180
         try:
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=30) as response:
                 response_body = response.read().decode('utf-8')
                 result_json = json.loads(response_body)
                 page_id = result_json.get('id')
@@ -971,7 +1091,14 @@ async def send_notion_message(report_title, ai_summary, all_valid_news, keywords
                 # 2. Add remaining blocks iteratively (Chunking)
                 if page_id and remaining_blocks:
                     for i in range(0, len(remaining_blocks), 100):
-                        time.sleep(0.5) # Rate limit safety (초당 3회 허용 / 여기서는 0.5초 대기로 안전망 확보)
+                        
+                        # [핵심 수정 부분] 반복문을 돌 때마다 스스로 시간 체크
+                        elapsed_time = time.time() - start_time
+                        if elapsed_time > timeout_limit:
+                            print(f"[경고] Notion 블록 전송이 3분({elapsed_time:.1f}초)을 초과하여 내부 작업을 강제 중단합니다.")
+                            break # 반복문을 빠져나가 스레드를 안전하게 종료시킴
+                            
+                        time.sleep(0.5) 
                         chunk = remaining_blocks[i : i + 100]
                         patch_data = {"children": chunk}
                         patch_req = urllib.request.Request(
@@ -980,10 +1107,10 @@ async def send_notion_message(report_title, ai_summary, all_valid_news, keywords
                             headers=HEADERS,
                             method='PATCH'
                         )
-                        with urllib.request.urlopen(patch_req) as patch_res:
+                        with urllib.request.urlopen(patch_req, timeout=30) as patch_res:
                             print(f"[알림] Notion 블럭 전송 {100 + i + 1} ~ {100 + i + len(chunk)} 추가 성공.")
                             
-                print("Notion 전송을 모두 완료했습니다.")
+                print("Notion 전송 작업을 종료합니다.")
                 
         except Exception as e:
             print(f"Notion Error: {type(e).__name__}")
