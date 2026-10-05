@@ -1,188 +1,130 @@
-# 주식 종목 뉴스 브리핑 시스템 (GitHub Actions 자동화)
+# Stock News Crawler
 
-## ⚠️ Public Repository 안내
+> 관심 종목 뉴스를 수집·정제하고, Gemini로 시장 관점의 브리핑을 생성해 Gmail과 Notion으로 전달하는 자동화 프로젝트입니다.
 
-본 레포지토리는 공개용(Public)으로 구성된 프로젝트입니다.
+## Public Repository 안내
 
-실제 운영 환경에서는:
-- GitHub Private Repository에서 자동화(GitHub Actions)가 실행되고 있으며
-- 데이터 파일(`data/`) 및 일부 설정은 **운영 목적에 맞게 별도로 관리**됩니다.
+이 저장소는 포트폴리오 공개용입니다. 실제 스케줄 실행과 비밀값 관리는 별도의 private 저장소에서 수행합니다.
 
-따라서 본 레포지토리의 `data/` 폴더는:
-- 구조 및 동작 설명을 위한 **샘플/간소화된 데이터**로 구성되어 있으며 실제 운영 데이터와는 차이가 있습니다.
+- GitHub Actions 워크플로우는 공개 저장소에 포함하지 않습니다.
+- API 키, OAuth 토큰, 데이터베이스 키 등 비밀값은 커밋하지 않습니다.
+- `data/`에는 구조와 실행 방식을 보여 주기 위한 축약 샘플만 포함합니다.
+- 운영 데이터와 실행 이력은 공개하지 않습니다.
 
-## 1. 개요
+## 문제와 접근
 
-주식 투자는 정보의 속도와 질이 핵심이지만, 개인이 매일 쏟아지는 방대한 양의 뉴스를 모두 파악하기에는 물리적인 한계가 있습니다. 특히 정보 지연으로 인해 주가 상승 이후에나 소식을 접하게 되는 기회비용 문제를 해결하고자 본 프로젝트를 기획했습니다.  
-본 시스템은 사용자가 설정한 관심 종목(data/종목명.json)을 기반으로 관련 뉴스를 정밀 타겟팅하여 수집합니다. 수집된 정보는 AI를 통해 시장 및 테마 관점에서 핵심 내용을 요약하고, 투자 결정에 유의미한 중요 뉴스를 선별하여 제공하는 자동화 솔루션입니다.
+여러 관심 종목의 최신 기사를 일일이 확인하면 중복 기사와 비관련 콘텐츠 때문에 시간이 많이 듭니다. 이 프로젝트는 최근 12시간의 뉴스를 병렬 수집한 뒤 규칙 기반 필터와 유사도 기반 중복 제거를 적용하고, 정제 전후의 토큰 사용량을 측정해 AI 요약 비용 절감 효과까지 추적합니다.
 
----
+## 주요 기능
 
-## 2. 로컬 버전(`종목명_news.py`)과의 주요 차이점
+- 네이버 뉴스 검색 API를 이용한 관심 종목별 뉴스 수집
+- 최대 5개 종목의 비동기 병렬 처리
+- 최근 12시간, 한국어 제목, 종목명 포함 여부 등 기본 적합성 검사
+- 스포츠·연예 등 차단 도메인, 허용되지 않은 대괄호 태그, 제외 단어 기반 노이즈 제거
+- 짧은 종목명이 긴 종목명 기사에 잘못 매칭되는 문제 방지
+- 토큰 교집합과 `difflib.SequenceMatcher`를 결합한 유사 기사 클러스터링
+- Supabase `stack_news` 테이블에 링크 기준 upsert, 최대 500건 단위 저장
+- 필터 전후 뉴스 수·제외 사유·중복 제거 수·Gemini 토큰 사용량을 `pipeline_run_metrics`에 기록
+- Gemini 모델 폴백과 재시도
+- Gmail HTML 브리핑 및 Notion 블록 페이지 생성
+- KST 기준 오전·오후 보고서 제목과 단계별 실행 시간 로그
 
-| 항목 | 로컬 버전 | GitHub Actions 버전 |
-|---|---|---|
-| **환경 변수** | `.env` 파일 | GitHub Secrets |
-| **DB 저장** | SQLite (`news_today.db`, `news_stack.db`) | Supabase (클라우드 PostgreSQL) |
-| **Gmail 인증 파일** | `token.json`, `credentials.json` | 파일 생성 없이 환경변수에서 메모리로 직접 인증 |
-| **실행 시간 기준** | 로컬 PC 시간 | **UTC → KST 변환 명시** (GitHub 서버는 UTC) |
-| **특징주.csv 경로** | `../../특징주/data/db/특징주.csv` | `../data/특징주.csv` (레포 내 data/폴더) |
-| **실행 방식** | 수동 실행/작업 스케줄러 | GitHub Actions 스케줄/수동 트리거 |
+## 처리 흐름
 
----
-
-## 3. GitHub 레포지토리 구조
-
-```
-(레포 최상단)
- ┣ .github/
- ┃  └ workflows/
- ┃     ┣ main.yml           ← 스케줄 자동 실행 워크플로우
- ┃     └ test_run.yml       ← Push 시 즉시 테스트용 워크플로우
- ┣ data/
- ┃  ┣ 종목명.json
- ┃  ┣ 종목명_test.json      ← 테스트용 소량 종목 목록
- ┃  ┣ 종목명_keyword.json
- ┃  ┣ 제외단어.json
- ┃  └ 특징주.csv       ← 과거 급등 이력 (Gemini 분석용)
- ┣ execution/
- ┃  └ github_종목명_news.py
- └ requirements.txt
+```text
+공개 샘플 종목 목록
+  → 네이버 뉴스 병렬 수집
+  → 12시간/언어/종목명 적합성 검사
+  → 도메인·태그·제외 단어 필터
+  → 유사 기사 클러스터링
+  → Supabase 뉴스 및 파이프라인 지표 저장
+  → 필터 전후 Gemini 입력 토큰 비교
+  → AI 브리핑 생성
+  → Gmail / Notion 전달
 ```
 
-> `.env`, `token.json`, `credentials.json`은 **GitHub Secrets**로 대체.
+## 저장소 구조
 
----
+```text
+.
+├─ data/
+│  ├─ 종목명_public.json
+│  ├─ 종목명_keyword_public.json
+│  ├─ 제외단어_public.json
+│  └─ 특징주_public.csv
+├─ execution/
+│  └─ github_종목명_news.py
+├─ .gitignore
+├─ requirements.txt
+└─ README.md
+```
 
-## 4. GitHub Secrets 등록 목록
+공개 코드에서는 위의 `_public` 샘플 파일을 읽도록 경로를 분리했습니다. private 저장소의 운영 파일과 GitHub Actions 설정은 변경하거나 복사하지 않습니다.
 
-GitHub 레포 → `Settings` → `Secrets and variables` → `Actions` → `New repository secret`에 아래 항목을 모두 등록.
+## 기술 스택
 
-| Secret 이름 | 내용 |
+- Python 3.11
+- `asyncio`, `requests`, `difflib`
+- Naver Search API
+- Google Gemini API (`google-genai`)
+- Supabase
+- Gmail API (OAuth 2.0)
+- Notion API
+
+## 실행 준비
+
+1. 저장소를 내려받고 가상환경을 만듭니다.
+2. `pip install -r requirements.txt`로 의존성을 설치합니다.
+3. 루트에 `.env`를 만들고 필요한 환경 변수를 설정합니다.
+4. 샘플 데이터 형식을 유지한 채 관심 종목과 필터 단어를 조정합니다.
+5. `python execution/github_종목명_news.py`를 실행합니다.
+
+필요한 환경 변수:
+
+| 변수 | 용도 |
 |---|---|
-| `NAVER_CLIENT_ID` | 네이버 API 클라이언트 ID |
-| `NAVER_CLIENT_SECRET` | 네이버 API 클라이언트 Secret |
-| `GEMINI_API_KEY` | Gemini API 키 |
-| `TELEGRAM_BOT_TOKEN` | 텔레그램 봇 토큰 |
-| `TELEGRAM_CHAT_ID` | 텔레그램 채팅 ID |
-| `GMAIL_USER` | 수신 이메일 주소 |
-| `NOTION_API_KEY` | 노션 통합 API 키 |
-| `GMAIL_TOKEN_JSON` | `token.json` 파일 전체 텍스트 |
-| `GMAIL_CREDENTIALS_JSON` | `credentials.json` 파일 전체 텍스트 |
+| `NAVER_CLIENT_ID` | 네이버 검색 API 클라이언트 ID |
+| `NAVER_CLIENT_SECRET` | 네이버 검색 API 클라이언트 Secret |
+| `gemini` | Gemini API 키 |
 | `SUPABASE_URL` | Supabase 프로젝트 URL |
-| `SUPABASE_KEY` | Supabase **service_role (Secret) 마스터 키** ← ⚠️ anon 키가 아닌 서버 전용 키 사용 |
+| `SUPABASE_KEY` | 서버 측 DB 작업용 키 |
+| `GMAIL_USER` | Gmail 발신/수신 계정 |
+| `GMAIL_TOKEN_JSON` | GitHub Actions 환경에서 사용할 OAuth 토큰 JSON |
+| `notion` | Notion Integration 키 |
+| `NOTION_DATABASE_ID` | 결과를 저장할 Notion 데이터베이스 ID |
+| `TELEGRAM_BOT_TOKEN` | 현재 실행 전 필수값 검사에 사용되는 봇 토큰 |
+| `telegram_chat_id` | 현재 실행 전 필수값 검사에 사용되는 채팅 ID |
 
----
+로컬 Gmail 인증은 `credentials.json`과 `token.json`을 사용합니다. 이 파일들과 `.env`는 `.gitignore`에 포함되어 있으며 절대 커밋하면 안 됩니다.
 
-## 5. 주요 기능
+## 공개 데이터 형식
 
-### 1. 5단계 노이즈 필터링
-단순 키워드 검색의 한계를 극복하기 위해 수집된 뉴스에 대해 엄격한 필터링을 거칩니다.
+`종목명_public.json`, `종목명_keyword_public.json`, `제외단어_public.json`은 JSON 문자열 배열입니다.
 
-1. **시간 필터링**: 실행 시점 기준 과거 12시간 이내의 기사만 통과
-2. **도메인 필터링**: 스포츠(`sports`), 연예(`entertain`), 블로그/포스트(`post`), 동영상(`tv`) 도메인 원천 차단
-3. **태그 필터링**: 대괄호 `[ ]` 내에 `[단독]`, `[속보]`, `[특징주]`, `[공시]` 외의 불필요한 태그가 있는 기사 제외
-4. **제외 단어 필터링**: `제외단어.json`에 포함된 단어가 제목에 있을 경우 제외
-5. **종목명 정확도 필터링**: 유사한 이름의 파생 종목(예: BGF vs BGF리테일) 기사가 섞이는 것을 방지
-
-### 2. Hybrid 클러스터링 (유사 기사 그룹화)
-동일한 이슈로 쏟아지는 중복 기사를 묶어 대표 기사 1개만 노출합니다.
-
-* 1차: 제목 특수문자 제거 후 토큰(Token) 집합의 교집합 개수 검사 (빠른 처리)
-* 2차: `difflib.SequenceMatcher`를 활용한 문자열 유사도 검사 (0.6 이상 매칭 시 동일 기사로 간주)
-
-### 3. AI 패턴 분석 (Gemini)
-단순 요약이 아닌 **과거 데이터 기반의 추론**을 수행합니다.
-
-* `data/특징주.csv`에 기록된 과거 종목들의 상승 논리와 오늘 수집된 뉴스를 대조합니다.
-* API 서버 지연 등에 대비하여 `gemini-3-flash-preview` → `gemini-2.5-flash` 순으로 Fallback(재시도) 로직이 구현되어 있습니다.
-
-### 4. 다중 채널 발송 포맷팅
-
-* **Telegram**: HTML 파싱을 적용하여 주요 제목과 강조 사항을 모바일에서 가독성 있게 전달
-* **Notion**: Blocks API를 사용하여 토글, 인용구, 배경색 등이 적용된 구조화된 페이지 자동 생성 (100개 단위 Chunk 전송)
-* **Gmail**: MIMEText와 인라인 HTML CSS를 적용하여 직관적인 브리핑 이메일 발송
-
----
-
-## 6. 처리 흐름
-
+```json
+["삼성전자", "SK하이닉스"]
 ```
-[GitHub Actions 실행 트리거 (스케줄 or 수동)]
-       ↓
-[환경 감지: GITHUB_ACTIONS 환경변수 확인]
-  ├── GitHub: Secrets → Secrets 데이터를 메모리(RAM)에 직접 로드
-  └── 로컬: .env 파일 로드
-       ↓
-[종목명.json 로드 → 네이버 API 순차 수집]
-       ↓
-[5단계 필터링 → 종목명 중복 방지]
-       ↓
-[Hybrid 클러스터링] → 대표 기사 선별
-       ↓
-[Supabase INSERT] → public.stack_news 테이블
-       ↓
-[특징주.csv 로드 (data/ 폴더)]
-       ↓
-[Gemini AI 분석] (모델 폴백: gemini-3-flash → gemini-2.5-flash → gemini-1.5-flash)
-       ↓
-[KST 시간 기준으로 오전/오후 판단 → 제목 생성]
-       ↓
-[멀티 채널 발송: Telegram + Notion + Gmail]
-```
-<img width="759" height="394" alt="image" src="https://github.com/user-attachments/assets/efea6e7c-93b4-4358-8cca-b3ec90722625" />
 
----
+`특징주_public.csv`는 데이터 구조를 보여 주기 위한 축약 샘플입니다. 현재 공개 코드에서는 직접 읽지 않으며, 실제 운영 데이터는 포함하지 않습니다.
 
-## 7. GitHub Actions 워크플로우 (yml)
+## 운영 및 보안 설계
 
-### main.yml — 스케줄 자동 실행
+- 자동 스케줄은 private 저장소의 GitHub Actions에서만 실행
+- 인증정보는 로컬 `.env` 또는 GitHub Secrets에서만 주입
+- 공개 저장소에는 워크플로우와 운영 데이터 미포함
+- 예외 로그에는 자격 증명 값을 출력하지 않고 오류 유형만 기록
+- Supabase 적재는 뉴스 링크를 충돌 키로 사용해 중복 저장 방지
 
-```yaml
-name: Daily News Briefing Crawler
+## 최근 반영 내용
 
-on:
-  schedule:
-    - cron: '30 22 * * *'  # 매일 한국시간 오전 7시 30분 (UTC 22:30) 실행
-    - cron: '30 10 * * *'  # 매일 한국시간 오후 7시 30분 (UTC 10:30) 실행
-  workflow_dispatch:       # 수동 버튼 생성용
+- 필터 제외 사유와 키워드별 제외 건수 집계
+- 필터 적용 전후 뉴스 기준 Gemini 입력 토큰 비교
+- 입력·출력·추론·전체 토큰과 절감률 기록
+- `pipeline_run_metrics` 실행 단위 관측성 추가
+- Supabase Python 클라이언트 기반 upsert로 저장 로직 정리
+- 최신 Gemini 모델 폴백 및 모델별 재시도 정책 반영
+- Gmail 인증 처리와 Notion 블록 변환 로직 개선
 
-jobs:
-  run-crawler:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30    # 🔥 추가된 부분: 30분 초과 시 작업 강제 종료
+## 참고
 
-    permissions:
-      contents: read
-      
-    steps:
-    - name: 📦 리포지토리 복사해오기
-      uses: actions/checkout@v6
-
-    - name: 🐍 파이썬 환경 세팅
-      uses: actions/setup-python@v6
-      with:
-        python-version: '3.11'
-
-    - name: 🛠️ 필요한 라이브러리 설치
-      run: |
-        pip install requests python-dotenv python-telegram-bot google-genai google-api-python-client google-auth-httplib2 google-auth-oauthlib supabase
-        
-    - name: 🚀 새싹 스크립트(github_종목명_news.py) 실행
-      env:
-        # 등록한 Secrets 변수들을 시스템에 연결
-        NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
-        NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
-        gemini: ${{ secrets.GEMINI_API_KEY }}
-        telegram_chat_id: ${{ secrets.TELEGRAM_CHAT_ID }}
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        GMAIL_USER: ${{ secrets.GMAIL_USER }}
-        notion: ${{ secrets.NOTION_API_KEY }}
-        GMAIL_TOKEN_JSON: ${{ secrets.GMAIL_TOKEN_JSON }}
-        GMAIL_CREDENTIALS_JSON: ${{ secrets.GMAIL_CREDENTIALS_JSON }}
-        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-      run: |
-        python execution/github_종목명_news.py
-```
+이 프로젝트의 결과는 정보 정리와 개인 연구를 위한 것으로, 투자 판단이나 수익을 보장하지 않습니다.
